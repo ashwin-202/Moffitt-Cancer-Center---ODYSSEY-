@@ -1,0 +1,504 @@
+# ---- app.R ----
+# Full Interactive Analytics Dashboard for Trainee Data
+# Supports CSV and Excel (.xls/.xlsx) uploads with sheet selector
+# Enhanced Missing Data tab: interactive heatmap, column summary, missing-rows table, custom missing tokens, download
+
+library(shiny)
+library(shinydashboard)
+library(DT)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(lubridate)
+library(readr)
+library(tidyr)
+library(readxl)   # dependency for Excel
+
+# ---------------- UI ----------------
+ui <- dashboardPage(
+  dashboardHeader(title = "Trainee Analytics Dashboard"),
+  
+  dashboardSidebar(
+    fileInput("file", "Upload Trainee file (CSV / XLS / XLSX)",
+              accept = c(".csv", ".xls", ".xlsx")),
+    uiOutput("sheet_ui"),
+    uiOutput("mentor_filter"),
+    uiOutput("status_filter"),
+    uiOutput("dept_filter"),
+    dateRangeInput("date_filter", "Start Date Range", start = NULL, end = NULL),
+    hr(),
+    sidebarMenu(
+      menuItem("Data Table", tabName = "data_tab", icon = icon("table")),
+      menuItem("Summary", tabName = "summary_tab", icon = icon("chart-bar")),
+      menuItem("Timeline", tabName = "timeline_tab", icon = icon("calendar-alt")),
+      menuItem("Missing Data", tabName = "missing_tab", icon = icon("exclamation-triangle"))
+    )
+  ),
+  
+  dashboardBody(
+    tabItems(
+      # ---- Data Table ----
+      tabItem(tabName = "data_tab",
+              fluidRow(box(width = 12, DTOutput("data_table")))
+      ),
+      
+      # ---- Summary ----
+      tabItem(tabName = "summary_tab",
+              fluidRow(
+                valueBoxOutput("total_box"),
+                valueBoxOutput("complete_box"),
+                valueBoxOutput("active_box")
+              ),
+              fluidRow(
+                box(width = 6, plotlyOutput("mentor_plot")),
+                box(width = 6, plotlyOutput("status_plot"))
+              )
+      ),
+      
+      # ---- Timeline ----
+      tabItem(tabName = "timeline_tab",
+              fluidRow(box(width = 12, plotlyOutput("timeline_plot", height = "600px")))
+      ),
+      
+      # ---- Missing Data ----
+      tabItem(tabName = "missing_tab",
+              fluidRow(
+                box(width = 4, title = "Missing Data Controls", status = "primary", solidHeader = TRUE,
+                    # choose which columns to include in missing analysis
+                    uiOutput("missing_cols_ui"),
+                    # toggle tokens considered missing
+                    checkboxInput("treat_blank", "Treat blank strings as missing", value = TRUE),
+                    checkboxInput("treat_na_literal", "Treat 'N/A' as missing", value = TRUE),
+                    checkboxInput("treat_unknown", "Treat 'Unknown' as missing", value = TRUE),
+                    textInput("extra_tokens", "Additional missing tokens (comma-separated)", placeholder = "e.g. -, none, n/a"),
+                    hr(),
+                    radioButtons("missing_view", "View",
+                                 choices = c("Heatmap" = "heatmap", "Column summary" = "summary", "Missing rows" = "rows"),
+                                 selected = "heatmap"),
+                    downloadButton("download_missing_rows", "Download missing rows")
+                ),
+                box(width = 8, title = "Missing Data Visualization", status = "primary", solidHeader = TRUE,
+                    conditionalPanel(
+                      "input.missing_view == 'heatmap'",
+                      plotlyOutput("missing_heatmap", height = "600px")
+                    ),
+                    conditionalPanel(
+                      "input.missing_view == 'summary'",
+                      DTOutput("missing_summary_table"),
+                      plotlyOutput("missing_summary_plot", height = "300px")
+                    ),
+                    conditionalPanel(
+                      "input.missing_view == 'rows'",
+                      DTOutput("missing_rows_table")
+                    )
+                )
+              )
+      )
+    )
+  )
+)
+
+# ---------------- SERVER ----------------
+server <- function(input, output, session) {
+  
+  # ---- Sheet selector UI for Excel files ----
+  output$sheet_ui <- renderUI({
+    req(input$file)
+    ext <- tolower(tools::file_ext(input$file$name))
+    if (ext %in% c("xls", "xlsx")) {
+      sheets <- tryCatch(excel_sheets(input$file$datapath), error = function(e) NULL)
+      if (is.null(sheets)) return(NULL)
+      selectInput("sheet", "Sheet", choices = sheets, selected = sheets[1])
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # ---- Load CSV or Excel (uses selected sheet for Excel) ----
+  data_raw <- reactive({
+    req(input$file)
+    f <- input$file
+    fp <- f$datapath
+    ext <- tolower(tools::file_ext(f$name))
+    
+    if (ext %in% c("xls", "xlsx")) {
+      req(input$sheet)
+      df <- read_excel(fp, sheet = input$sheet)
+      df <- as.data.frame(df, stringsAsFactors = FALSE)
+    } else if (ext == "csv") {
+      df <- read_csv(fp, show_col_types = FALSE)
+      df <- as.data.frame(df, stringsAsFactors = FALSE)
+    } else {
+      stop("Unsupported file type. Please upload a .csv, .xls or .xlsx file.")
+    }
+    names(df) <- make.names(names(df))
+    df
+  })
+  
+  # ---- Filters ----
+  observeEvent(data_raw(), {
+    data <- data_raw()
+    start_col <- if ("Start.Date" %in% names(data)) "Start.Date" else 
+      if ("StartDate" %in% names(data)) "StartDate" else NULL
+    end_col   <- if ("End.Date" %in% names(data)) "End.Date" else 
+      if ("EndDate" %in% names(data)) "EndDate" else NULL
+    
+    if (!is.null(start_col)) {
+      parsed_start <- parse_date_time(data[[start_col]], orders = c("mdy","ymd","dmy","ymd HMS","mdy HMS"), quiet = TRUE)
+      parsed_end   <- if (!is.null(end_col)) parse_date_time(data[[end_col]], orders = c("mdy","ymd","dmy","ymd HMS","mdy HMS"), quiet = TRUE) else parsed_start
+      
+      if (all(is.na(parsed_start))) return()
+      updateDateRangeInput(session, "date_filter",
+                           start = min(parsed_start, na.rm = TRUE),
+                           end = max(parsed_end, na.rm = TRUE))
+    }
+  })
+  
+  output$mentor_filter <- renderUI({
+    req(data_raw())
+    df <- data_raw()
+    mentor_col <- NULL
+    candidates <- c("Mentor","Mentor.Name","MentorName","Mentor_ID","Mentor.ID")
+    for (c in candidates) if (c %in% names(df)) { mentor_col <- c; break }
+    if (is.null(mentor_col)) {
+      text_cols <- names(df)[sapply(df, function(x) is.character(x) || is.factor(x))]
+      if (length(text_cols) > 0) mentor_col <- text_cols[1] else mentor_col <- names(df)[1]
+    }
+    selectInput("mentor", "Mentor", choices = c("All", sort(unique(na.omit(df[[mentor_col]])))), selected = "All")
+  })
+  
+  output$status_filter <- renderUI({
+    req(data_raw())
+    df <- data_raw()
+    status_col <- if ("Status" %in% names(df)) "Status" else if ("status" %in% names(df)) "status" else NULL
+    if (is.null(status_col)) {
+      text_cols <- names(df)[sapply(df, function(x) is.character(x) || is.factor(x))]
+      status_col <- if (length(text_cols) >= 1) text_cols[1] else names(df)[1]
+    }
+    selectInput("status", "Status", choices = c("All", sort(unique(na.omit(df[[status_col]])))), selected = "All")
+  })
+  
+  output$dept_filter <- renderUI({
+    req(data_raw())
+    df <- data_raw()
+    dept_col <- if ("Department" %in% names(df)) "Department" else if ("Dept" %in% names(df)) "Dept" else NULL
+    if (is.null(dept_col)) {
+      text_cols <- names(df)[sapply(df, function(x) is.character(x) || is.factor(x))]
+      dept_col <- if (length(text_cols) >= 2) text_cols[2] else if (length(text_cols) == 1) text_cols[1] else names(df)[1]
+    }
+    selectInput("dept", "Department", choices = c("All", sort(unique(na.omit(df[[dept_col]])))), selected = "All")
+  })
+  
+  # ---- Filtered Data ----
+  data_filtered <- reactive({
+    req(data_raw())
+    df <- data_raw()
+    
+    if (!is.null(input$mentor) && input$mentor != "All" && "Mentor" %in% names(df)) {
+      df <- df %>% filter(Mentor == input$mentor)
+    } else if (!is.null(input$mentor) && input$mentor != "All") {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) > 0) df <- df %>% filter(.data[[char_cols[1]]] == input$mentor)
+    }
+    
+    if (!is.null(input$status) && input$status != "All" && "Status" %in% names(df)) {
+      df <- df %>% filter(Status == input$status)
+    } else if (!is.null(input$status) && input$status != "All") {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) > 0) df <- df %>% filter(.data[[char_cols[1]]] == input$status)
+    }
+    
+    if (!is.null(input$dept) && input$dept != "All" && "Department" %in% names(df)) {
+      df <- df %>% filter(Department == input$dept)
+    } else if (!is.null(input$dept) && input$dept != "All") {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) > 1) df <- df %>% filter(.data[[char_cols[2]]] == input$dept)
+    }
+    
+    # Handle date filtering (attempt common date column names)
+    start_col <- if ("Start.Date" %in% names(df)) "Start.Date" else if ("StartDate" %in% names(df)) "StartDate" else NULL
+    end_col   <- if ("End.Date" %in% names(df)) "End.Date" else if ("EndDate" %in% names(df)) "EndDate" else NULL
+    
+    if (!is.null(input$date_filter[1]) && !is.null(input$date_filter[2]) && !is.null(start_col)) {
+      df <- df %>% 
+        mutate(
+          !!start_col := parse_date_time(.data[[start_col]], orders = c("mdy", "ymd", "dmy", "mdy HMS", "ymd HMS"), quiet = TRUE),
+          !!end_col := if (!is.null(end_col)) parse_date_time(.data[[end_col]], orders = c("mdy", "ymd", "dmy", "mdy HMS", "ymd HMS"), quiet = TRUE) else .data[[start_col]]
+        ) %>%
+        filter(.data[[start_col]] >= input$date_filter[1], .data[[start_col]] <= input$date_filter[2])
+    }
+    df
+  })
+  
+  # ---- Data Table ----
+  output$data_table <- renderDT({
+    datatable(
+      data_filtered(),
+      extensions = "Buttons",
+      options = list(
+        dom = "Bfrtip",
+        buttons = c("copy", "csv", "excel", "pdf", "print"),
+        pageLength = 10,
+        scrollX = TRUE
+      )
+    )
+  })
+  
+  # ---- Summary Boxes ----
+  output$total_box <- renderValueBox({
+    valueBox(nrow(data_filtered()), "Total Trainees", icon = icon("users"), color = "blue")
+  })
+  
+  output$complete_box <- renderValueBox({
+    df <- data_filtered()
+    complete <- 0
+    if ("Status" %in% names(df)) {
+      complete <- sum(df$Status == "Complete", na.rm = TRUE)
+    } else {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) > 0) complete <- sum(tolower(df[[char_cols[1]]]) == "complete", na.rm = TRUE)
+    }
+    percent <- if (nrow(df) > 0) round(100 * complete / nrow(df), 1) else 0
+    valueBox(paste0(complete, " (", percent, "%)"), "Completed", icon = icon("check-circle"), color = "green")
+  })
+  
+  output$active_box <- renderValueBox({
+    df <- data_filtered()
+    active <- 0
+    if ("Status" %in% names(df)) {
+      active <- sum(df$Status == "Active", na.rm = TRUE)
+    } else {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) > 0) active <- sum(tolower(df[[char_cols[1]]]) == "active", na.rm = TRUE)
+    }
+    percent <- if (nrow(df) > 0) round(100 * active / nrow(df), 1) else 0
+    valueBox(paste0(active, " (", percent, "%)"), "Active", icon = icon("running"), color = "yellow")
+  })
+  
+  # ---- Mentor Distribution ----
+  output$mentor_plot <- renderPlotly({
+    df <- data_filtered()
+    if (!"Mentor" %in% names(df)) {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) == 0) return(NULL)
+      mentor_col <- char_cols[1]
+    } else mentor_col <- "Mentor"
+    
+    dfc <- df %>% count(.data[[mentor_col]])
+    names(dfc) <- c("Mentor", "n")
+    p <- ggplot(dfc, aes(x = reorder(Mentor, n), y = n, fill = Mentor)) +
+      geom_bar(stat = "identity") +
+      coord_flip() + theme_minimal() +
+      labs(title = "Trainees per Mentor", x = "", y = "Count")
+    ggplotly(p)
+  })
+  
+  # ---- Status Distribution ----
+  output$status_plot <- renderPlotly({
+    df <- data_filtered()
+    if (!"Status" %in% names(df)) {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) == 0) return(NULL)
+      status_col <- char_cols[1]
+    } else status_col <- "Status"
+    
+    dfc <- df %>% count(.data[[status_col]])
+    names(dfc) <- c("Status", "n")
+    p <- ggplot(dfc, aes(x = Status, y = n, fill = Status)) +
+      geom_bar(stat = "identity") + theme_minimal() +
+      labs(title = "Status Distribution", y = "Count")
+    ggplotly(p)
+  })
+  
+  # ---- Timeline (Gantt Chart) ----
+  output$timeline_plot <- renderPlotly({
+    df <- data_filtered()
+    start_col <- if ("Start.Date" %in% names(df)) "Start.Date" else if ("StartDate" %in% names(df)) "StartDate" else NULL
+    end_col   <- if ("End.Date" %in% names(df)) "End.Date" else if ("EndDate" %in% names(df)) "EndDate" else NULL
+    mentor_col <- if ("Mentor" %in% names(df)) "Mentor" else {
+      char_cols <- names(df)[sapply(df, is.character)]
+      if (length(char_cols) > 0) char_cols[1] else names(df)[1]
+    }
+    if (is.null(start_col) || is.null(end_col)) return(NULL)
+    
+    dfp <- df %>%
+      mutate(
+        Start.Date = parse_date_time(.data[[start_col]], orders = c("mdy", "ymd", "dmy", "mdy HMS", "ymd HMS"), quiet = TRUE),
+        End.Date   = parse_date_time(.data[[end_col]], orders = c("mdy", "ymd", "dmy", "mdy HMS", "ymd HMS"), quiet = TRUE)
+      ) %>%
+      filter(!is.na(Start.Date) & !is.na(End.Date))
+    
+    p <- ggplot(dfp, aes(y = reorder(.data[[mentor_col]], Start.Date), x = Start.Date, xend = End.Date, color = ifelse("Status" %in% names(dfp), as.character(Status), "Unknown"))) +
+      geom_segment(aes(yend = .data[[mentor_col]]), size = 4, lineend = "round") +
+      theme_minimal() +
+      labs(title = "Trainee Duration Timeline", x = "Date", y = "Mentor") +
+      scale_color_manual(values = c("Complete" = "green", "Active" = "orange", "Unknown" = "grey"))
+    ggplotly(p)
+  })
+  
+  # ---------------- Missing data logic ----------------
+  # UI: columns available for missing analysis
+  output$missing_cols_ui <- renderUI({
+    req(data_raw())
+    cols <- names(data_raw())
+    selectizeInput("missing_cols", "Columns to analyze (blank = all)", choices = cols,
+                   selected = cols, multiple = TRUE, options = list(placeholder = 'Select columns or leave all'))
+  })
+  
+  # Helper: parse extra tokens
+  extra_tokens_vec <- reactive({
+    txt <- input$extra_tokens %||% ""
+    tokens <- unlist(strsplit(txt, ","))
+    tokens <- trimws(tokens)
+    tokens[tokens != ""]
+  })
+  
+  # Reactive: compute logical missing matrix and summary
+  missing_calc <- reactive({
+    df <- data_filtered()
+    req(df)
+    # choose columns
+    if (!is.null(input$missing_cols) && length(input$missing_cols) > 0) {
+      cols <- intersect(input$missing_cols, names(df))
+    } else {
+      cols <- names(df)
+    }
+    if (length(cols) == 0) return(NULL)
+    
+    # Build vector of tokens considered missing
+    tokens <- character(0)
+    if (isTRUE(input$treat_blank)) tokens <- c(tokens, "")
+    if (isTRUE(input$treat_na_literal)) tokens <- c(tokens, "N/A", "n/a")
+    if (isTRUE(input$treat_unknown)) tokens <- c(tokens, "Unknown", "unknown")
+    tokens <- c(tokens, extra_tokens_vec())
+    tokens <- unique(tokens)
+    
+    # Function to test missingness for a value
+    is_missing_value <- function(x) {
+      # NA values are missing
+      if (is.na(x)) return(TRUE)
+      # convert to character for token comparison
+      ch <- as.character(x)
+      # empty string
+      if (ch == "" && ("" %in% tokens)) return(TRUE)
+      # exact token matches (case-insensitive)
+      if (tolower(ch) %in% tolower(tokens)) return(TRUE)
+      # otherwise not missing
+      return(FALSE)
+    }
+    
+    # Apply per selected column
+    missing_mat <- vapply(df[cols], function(col) {
+      vapply(col, is_missing_value, logical(1))
+    }, logical(nrow(df)))
+    # missing_mat is a matrix with nrow rows, ncol columns (logical)
+    # Ensure columns orientation: rows x cols
+    missing_df <- as.data.frame(missing_mat)
+    names(missing_df) <- cols
+    # Summary per column
+    col_missing_count <- colSums(missing_df, na.rm = TRUE)
+    col_missing_pct <- round(100 * col_missing_count / nrow(df), 2)
+    summary_df <- data.frame(
+      Column = cols,
+      MissingCount = as.integer(col_missing_count),
+      MissingPercent = as.numeric(col_missing_pct),
+      stringsAsFactors = FALSE
+    ) %>% arrange(desc(MissingPercent))
+    
+    # Rows that have any missing (subset)
+    rows_with_missing <- df[rowSums(missing_df) > 0, , drop = FALSE]
+    
+    list(
+      missing_matrix = missing_df,
+      summary = summary_df,
+      rows = rows_with_missing
+    )
+  })
+  
+  # ---- Missing heatmap (plotly) ----
+  output$missing_heatmap <- renderPlotly({
+    mc <- missing_calc()
+    req(mc)
+    mm <- mc$missing_matrix
+    if (nrow(mm) == 0 || ncol(mm) == 0) return(NULL)
+    # Convert logical to numeric for heatmap (1 = missing, 0 = present)
+    z <- t(apply(mm, 1, as.integer))  # transpose so x=columns, y=rows in plotly heatmap semantics
+    # For readability limit large displays: if many rows, sample or aggregate?
+    # We'll show the full matrix but warn user via hover; performance depends on dataset size.
+    plot_ly(
+      x = colnames(mm),
+      y = paste0("row_", seq_len(nrow(mm))),
+      z = z,
+      type = "heatmap",
+      colorscale = list(c(0,1), c("white","red")),
+      showscale = TRUE,
+      hovertemplate = paste(
+        "<b>%{y}</b><br>Column: %{x}<br>",
+        "Missing: %{z}<extra></extra>"
+      )
+    ) %>%
+      layout(title = "Missing Data Heatmap (red = missing)",
+             xaxis = list(title = "Columns", tickangle = -45),
+             yaxis = list(title = "Rows", autorange = "reversed"))
+  })
+  
+  # ---- Missing summary table (DT) ----
+  output$missing_summary_table <- renderDT({
+    mc <- missing_calc()
+    req(mc)
+    datatable(mc$summary, options = list(pageLength = 10, dom = "Bfrtip"),
+              rownames = FALSE)
+  })
+  
+  # ---- Missing summary plot (bar) ----
+  output$missing_summary_plot <- renderPlotly({
+    mc <- missing_calc()
+    req(mc)
+    df <- mc$summary
+    if (nrow(df) == 0) return(NULL)
+    p <- ggplot(df, aes(x = reorder(Column, MissingPercent), y = MissingPercent)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      theme_minimal() +
+      labs(title = "Percent Missing by Column", x = "", y = "Percent missing")
+    ggplotly(p, tooltip = c("y","x"))
+  })
+  
+  # ---- Missing rows table (DT) ----
+  output$missing_rows_table <- renderDT({
+    mc <- missing_calc()
+    req(mc)
+    rows_df <- mc$rows
+    if (nrow(rows_df) == 0) {
+      datatable(data.frame(Note = "No rows with missing values based on current settings"), options = list(dom = 't'))
+    } else {
+      datatable(rows_df, extensions = "Buttons",
+                options = list(dom = "Bfrtip", buttons = c("copy","csv","excel"), pageLength = 10, scrollX = TRUE))
+    }
+  })
+  
+  # ---- Download missing rows ----
+  output$download_missing_rows <- downloadHandler(
+    filename = function() {
+      paste0("missing_rows_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      mc <- missing_calc()
+      req(mc)
+      rows_df <- mc$rows
+      if (nrow(rows_df) == 0) {
+        # write an informative CSV
+        write.csv(data.frame(note = "No rows with missing values based on current settings"), file, row.names = FALSE)
+      } else {
+        write.csv(rows_df, file, row.names = FALSE)
+      }
+    }
+  )
+  
+  # ---- Missing calc reactive invalidation tip:
+  # The missing_calc() reacts to data_filtered(), input$missing_cols, input$treat_*, input$extra_tokens.
+  # No explicit action button needed; updates live when controls change.
+  
+}
+
+shinyApp(ui, server)
